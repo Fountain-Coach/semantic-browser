@@ -1,0 +1,743 @@
+openapi: 3.1.0
+info:
+  title: Semantic Browser & Dissector API
+  version: 0.2.0
+  summary: >
+    A Swift-only, JS-capable semantic browser that (1) renders a page, (2) snapshots network+DOM,
+    (3) semantically dissects rendered content into blocks/entities/claims/tables with span-level citations,
+    and (4) optionally indexes derived objects (pages/segments/entities/tables) into Typesense.
+  contact:
+    name: FountainAI
+    url: https://fountain.coach
+servers:
+  - url: https://semantic-browser.local
+    description: Local development
+  - url: https://api.fountain.coach/semantic-browser
+    description: Production
+
+tags:
+  - name: Browse
+    description: Navigate with a real browser (CDP/WebKit), wait for readiness, and capture a Snapshot.
+  - name: Analyze
+    description: Turn a Snapshot into a normalized Analysis (blocks, entities, claims, tables, summaries).
+  - name: Index
+    description: Upsert derived objects into Typesense. Typesense is a query index, not a source of truth.
+  - name: Query
+    description: Query previously indexed pages, segments, entities, and tables.
+  - name: Export
+    description: Export artifacts (rendered HTML/text/markdown/tables.csv) for auditing and handoff.
+  - name: Admin
+    description: Health, version, and runtime information.
+
+security:
+  - ApiKeyAuth: []
+
+paths:
+  /v1/browse:
+    post:
+      operationId: browseAndDissect
+      tags: [Browse]
+      summary: Navigate to a URL, snapshot the rendered page, optionally analyze and index in a single call.
+      description: >
+        Executes JavaScript (via a headless browser), waits for page readiness, captures DOM and network
+        responses, optionally runs semantic dissection and Typesense indexing. Returns the Snapshot and,
+        if requested, the Analysis and Index summary.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/BrowseRequest"
+            examples:
+              basic:
+                value:
+                  url: "https://github.com/explore"
+                  wait: { strategy: "networkIdle", networkIdleMs: 500, maxWaitMs: 10000 }
+                  mode: "standard"
+                  index: { enabled: true }
+      responses:
+        "200":
+          description: Snapshot (and optionally Analysis + Index result)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BrowseResponse"
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "429": { $ref: "#/components/responses/TooManyRequests" }
+        "500": { $ref: "#/components/responses/ServerError" }
+
+  /v1/snapshot:
+    post:
+      operationId: snapshotOnly
+      tags: [Browse]
+      summary: Navigate and return only the Snapshot (no semantic analysis).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/SnapshotRequest" }
+      responses:
+        "200":
+          description: Snapshot captured
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SnapshotResponse" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "429": { $ref: "#/components/responses/TooManyRequests" }
+        "500": { $ref: "#/components/responses/ServerError" }
+
+  /v1/analyze:
+    post:
+      operationId: analyzeSnapshot
+      tags: [Analyze]
+      summary: Run semantic dissection on a Snapshot (inline or by reference).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/AnalyzeRequest" }
+            examples:
+              byId:
+                value:
+                  snapshotRef: { snapshotId: "snap_01HXYZ..." }
+                  mode: "deep"
+      responses:
+        "200":
+          description: Analysis produced
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Analysis" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "500": { $ref: "#/components/responses/ServerError" }
+
+  /v1/index:
+    post:
+      operationId: indexAnalysis
+      tags: [Index]
+      summary: Upsert Analysis-derived objects (page/segments/entities/tables) into Typesense.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/IndexRequest" }
+      responses:
+        "200":
+          description: Index summary
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/IndexResult" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "502": { $ref: "#/components/responses/UpstreamError" }
+
+  /v1/pages:
+    get:
+      operationId: queryPages
+      tags: [Query]
+      summary: Search previously indexed pages in Typesense.
+      parameters:
+        - name: q
+          in: query
+          description: Full-text query string.
+          schema: { type: string }
+        - name: host
+          in: query
+          description: Filter by page host (e.g., github.com).
+          schema: { type: string }
+        - name: lang
+          in: query
+          description: ISO language code filter.
+          schema: { type: string, pattern: "^[a-z]{2}(-[A-Z]{2})?$" }
+        - name: after
+          in: query
+          description: Filter pages fetched after this instant (RFC 3339).
+          schema: { type: string, format: date-time }
+        - name: before
+          in: query
+          description: Filter pages fetched before this instant (RFC 3339).
+          schema: { type: string, format: date-time }
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 200, default: 20 }
+        - name: offset
+          in: query
+          schema: { type: integer, minimum: 0, default: 0 }
+      responses:
+        "200":
+          description: Page hits
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  total: { type: integer }
+                  items:
+                    type: array
+                    items: { $ref: "#/components/schemas/PageDoc" }
+
+  /v1/pages/{id}:
+    get:
+      operationId: getPage
+      tags: [Query]
+      summary: Fetch a single indexed page document by ID.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: Page document ID (Typesense or canonical ID).
+          schema: { type: string }
+      responses:
+        "200":
+          description: Page document
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PageDoc" }
+        "404":
+          description: Not found
+
+  /v1/segments:
+    get:
+      operationId: querySegments
+      tags: [Query]
+      summary: Search segments (headings/paragraphs/code/captions/tables).
+      parameters:
+        - name: q
+          in: query
+          description: Full-text query string.
+          schema: { type: string }
+        - name: kind
+          in: query
+          schema:
+            type: string
+            enum: [heading, paragraph, code, caption, table]
+        - name: entity
+          in: query
+          schema: { type: string, description: "Filter segments mentioning a canonical entity" }
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 200, default: 20 }
+        - name: offset
+          in: query
+          schema: { type: integer, minimum: 0, default: 0 }
+      responses:
+        "200":
+          description: Segment hits
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  total: { type: integer }
+                  items:
+                    type: array
+                    items: { $ref: "#/components/schemas/SegmentDoc" }
+
+  /v1/entities:
+    get:
+      operationId: queryEntities
+      tags: [Query]
+      summary: Search canonicalized entities.
+      parameters:
+        - name: q
+          in: query
+          description: Full-text query string.
+          schema: { type: string }
+        - name: type
+          in: query
+          schema: { type: string, enum: [PERSON, ORG, LOC, PROD, EVENT, OTHER] }
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 200, default: 20 }
+        - name: offset
+          in: query
+          schema: { type: integer, minimum: 0, default: 0 }
+      responses:
+        "200":
+          description: Entity hits
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  total: { type: integer }
+                  items:
+                    type: array
+                    items: { $ref: "#/components/schemas/EntityDoc" }
+
+  /v1/export:
+    get:
+      operationId: exportArtifacts
+      tags: [Export]
+      summary: Export artifacts for a page/analysis.
+      parameters:
+        - name: pageId
+          in: query
+          required: true
+          schema: { type: string }
+        - name: format
+          in: query
+          required: true
+          schema:
+            type: string
+            enum: [snapshot.html, snapshot.text, analysis.json, summary.md, tables.csv]
+      responses:
+        "200":
+          description: Artifact stream
+          content:
+            text/html: { schema: { type: string } }
+            text/plain: { schema: { type: string } }
+            application/json: { schema: { type: object } }
+            text/markdown: { schema: { type: string } }
+            text/csv: { schema: { type: string } }
+        "404": { description: Not found }
+
+  /v1/health:
+    get:
+      operationId: health
+      tags: [Admin]
+      summary: Liveness and readiness probe.
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, enum: [ok] }
+                  version: { type: string }
+                  browserPool:
+                    type: object
+                    properties:
+                      capacity: { type: integer }
+                      inUse: { type: integer }
+
+components:
+  securitySchemes:
+    ApiKeyAuth:
+      type: apiKey
+      in: header
+      name: X-API-Key
+
+  parameters:
+    q:
+      name: q
+      in: query
+      description: Full-text query string.
+      schema: { type: string }
+    host:
+      name: host
+      in: query
+      description: Filter by page host (e.g., github.com).
+      schema: { type: string }
+    lang:
+      name: lang
+      in: query
+      description: ISO language code filter.
+      schema: { type: string, pattern: "^[a-z]{2}(-[A-Z]{2})?$" }
+    after:
+      name: after
+      in: query
+      description: Filter pages fetched after this instant (RFC 3339).
+      schema: { type: string, format: date-time }
+    before:
+      name: before
+      in: query
+      description: Filter pages fetched before this instant (RFC 3339).
+      schema: { type: string, format: date-time }
+    limit:
+      name: limit
+      in: query
+      schema: { type: integer, minimum: 1, maximum: 200, default: 20 }
+    offset:
+      name: offset
+      in: query
+      schema: { type: integer, minimum: 0, default: 0 }
+
+  responses:
+    BadRequest:
+      description: Bad request
+      content:
+        application/json: { schema: { $ref: "#/components/schemas/Error" } }
+    TooManyRequests:
+      description: Client or host concurrency/rate limit exceeded
+      headers:
+        Retry-After:
+          description: Seconds until a new attempt is allowed.
+          schema: { type: integer }
+      content:
+        application/json: { schema: { $ref: "#/components/schemas/Error" } }
+    UpstreamError:
+      description: Upstream service error (e.g., Typesense unavailable)
+      content:
+        application/json: { schema: { $ref: "#/components/schemas/Error" } }
+    ServerError:
+      description: Unexpected server error
+      content:
+        application/json: { schema: { $ref: "#/components/schemas/Error" } }
+
+  schemas:
+    # -------- Requests / Orchestration --------
+    BrowseRequest:
+      type: object
+      required: [url, wait, mode]
+      properties:
+        url: { type: string, format: uri }
+        wait:
+          $ref: "#/components/schemas/WaitPolicy"
+        mode:
+          $ref: "#/components/schemas/DissectionMode"
+        index:
+          $ref: "#/components/schemas/IndexOptions"
+        storeArtifacts:
+          type: boolean
+          description: Persist snapshot & analysis artifacts for later export.
+          default: true
+        labels:
+          type: array
+          items: { type: string }
+          description: Optional labels to tag the page in Typesense facets.
+
+    BrowseResponse:
+      type: object
+      required: [snapshot]
+      properties:
+        snapshot:
+          $ref: "#/components/schemas/Snapshot"
+        analysis:
+          $ref: "#/components/schemas/Analysis"
+        index:
+          $ref: "#/components/schemas/IndexResult"
+
+    SnapshotRequest:
+      type: object
+      required: [url, wait]
+      properties:
+        url: { type: string, format: uri }
+        wait: { $ref: "#/components/schemas/WaitPolicy" }
+        storeArtifacts:
+          type: boolean
+          default: true
+
+    SnapshotResponse:
+      type: object
+      required: [snapshot]
+      properties:
+        snapshot: { $ref: "#/components/schemas/Snapshot" }
+
+    AnalyzeRequest:
+      type: object
+      required: [mode]
+      properties:
+        snapshot:
+          $ref: "#/components/schemas/Snapshot"
+        snapshotRef:
+          type: object
+          properties:
+            snapshotId: { type: string }
+          description: Use a stored snapshot by ID (mutually exclusive with inline snapshot).
+        mode:
+          $ref: "#/components/schemas/DissectionMode"
+
+    IndexRequest:
+      type: object
+      required: [analysis]
+      properties:
+        analysis:
+          $ref: "#/components/schemas/Analysis"
+        options:
+          $ref: "#/components/schemas/IndexOptions"
+
+    IndexOptions:
+      type: object
+      properties:
+        enabled:
+          type: boolean
+          default: true
+        pagesCollection:
+          type: string
+          default: pages
+        segmentsCollection:
+          type: string
+          default: segments
+        entitiesCollection:
+          type: string
+          default: entities
+        tablesCollection:
+          type: string
+          default: tables
+        typesense:
+          type: object
+          description: Minimal Typesense connection details.
+          properties:
+            url: { type: string, format: uri }
+            apiKey: { type: string }
+            timeoutMs: { type: integer, default: 3000 }
+
+    DissectionMode:
+      type: string
+      enum: [quick, standard, deep]
+      description: quick=outline+summary, standard=+entities/tables, deep=+claims/relations.
+
+    WaitPolicy:
+      type: object
+      required: [strategy]
+      properties:
+        strategy:
+          type: string
+          enum: [domContentLoaded, networkIdle, selector]
+        networkIdleMs:
+          type: integer
+          minimum: 0
+          description: Quiescence window; used when strategy=networkIdle.
+        selector:
+          type: string
+          description: CSS selector to await; used when strategy=selector.
+        maxWaitMs:
+          type: integer
+          minimum: 1
+          default: 15000
+
+    # -------- Snapshot / Analysis --------
+    Snapshot:
+      type: object
+      required: [snapshotId, page, rendered]
+      properties:
+        snapshotId: { type: string }
+        page:
+          type: object
+          required: [uri, fetchedAt, status, contentType]
+          properties:
+            uri: { type: string, format: uri }
+            finalUrl: { type: string, format: uri }
+            fetchedAt: { type: string, format: date-time }
+            status: { type: integer }
+            contentType: { type: string }
+            navigation:
+              type: object
+              properties:
+                ttfbMs: { type: integer }
+                loadMs: { type: integer }
+        rendered:
+          type: object
+          required: [html, text]
+          properties:
+            html: { type: string }
+            text: { type: string }
+            meta:
+              type: object
+              additionalProperties: { type: string }
+        network:
+          type: object
+          properties:
+            requests:
+              type: array
+              items:
+                type: object
+                properties:
+                  url: { type: string, format: uri }
+                  type: { type: string, enum: [Document, Stylesheet, Image, Media, Font, Script, XHR, Fetch, Other] }
+                  status: { type: integer }
+                  body: { type: string, description: "Captured body (sniffed; may be truncated for large content)" }
+        diagnostics:
+          type: array
+          items: { type: string }
+
+    Analysis:
+      type: object
+      required: [envelope, blocks, summaries, provenance]
+      properties:
+        envelope:
+          type: object
+          required: [id, source, contentType, language]
+          properties:
+            id: { type: string, description: "sha256 of raw bytes or url+etag" }
+            source:
+              type: object
+              properties:
+                uri: { type: string, format: uri }
+                fetchedAt: { type: string, format: date-time }
+            contentType: { type: string }
+            language: { type: string }
+            bytes: { type: integer }
+            diagnostics:
+              type: array
+              items: { type: string }
+        blocks:
+          type: array
+          items:
+            $ref: "#/components/schemas/Block"
+        semantics:
+          type: object
+          properties:
+            outline:
+              type: array
+              items:
+                type: object
+                properties:
+                  block: { type: string }
+                  level: { type: integer, minimum: 1, maximum: 6 }
+            entities:
+              type: array
+              items: { $ref: "#/components/schemas/Entity" }
+            claims:
+              type: array
+              items: { $ref: "#/components/schemas/Claim" }
+            relations:
+              type: array
+              items:
+                type: object
+                properties:
+                  type: { type: string, enum: [SUPPORTS, CONTRADICTS, CITES, REFERS_TO] }
+                  from: { type: string }
+                  to: { type: string }
+        summaries:
+          type: object
+          properties:
+            abstract: { type: string }
+            keyPoints:
+              type: array
+              items: { type: string }
+            tl;dr: { type: string }
+        provenance:
+          type: object
+          properties:
+            pipeline: { type: string }
+            model: { type: string }
+
+    Block:
+      type: object
+      required: [id, kind, text]
+      properties:
+        id: { type: string }
+        kind:
+          type: string
+          enum: [heading, paragraph, code, caption, table]
+        level:
+          type: integer
+          description: Heading level (1..6) when kind=heading.
+        text:
+          type: string
+        span:
+          type: array
+          items: { type: integer }
+          minItems: 2
+          maxItems: 2
+          description: Character offsets [start,end) into rendered.text
+        table:
+          $ref: "#/components/schemas/Table"
+
+    Table:
+      type: object
+      required: [rows]
+      properties:
+        caption: { type: string }
+        columns:
+          type: array
+          items: { type: string }
+        rows:
+          type: array
+          items:
+            type: array
+            items: { type: string }
+
+    Entity:
+      type: object
+      required: [id, name, type, mentions]
+      properties:
+        id: { type: string }
+        name: { type: string }
+        type: { type: string, enum: [PERSON, ORG, LOC, PROD, EVENT, OTHER] }
+        mentions:
+          type: array
+          items:
+            type: object
+            properties:
+              block: { type: string }
+              span:
+                type: array
+                items: { type: integer }
+                minItems: 2
+                maxItems: 2
+
+    Claim:
+      type: object
+      required: [id, text, evidence]
+      properties:
+        id: { type: string }
+        text: { type: string }
+        stance: { type: string, enum: [AUTHOR_ASSERTED, REPORTED, UNCERTAIN], default: AUTHOR_ASSERTED }
+        hedge: { type: string, enum: [LOW, MEDIUM, HIGH], default: MEDIUM }
+        evidence:
+          type: array
+          items:
+            type: object
+            properties:
+              block: { type: string }
+              span:
+                type: array
+                items: { type: integer }
+                minItems: 2
+                maxItems: 2
+              tableCell:
+                type: array
+                items: { type: integer }
+                minItems: 2
+                maxItems: 2
+                description: Optional [rowIndex, colIndex] when citing a table cell
+
+    # -------- Index (Typesense-shaped docs) --------
+    PageDoc:
+      type: object
+      properties:
+        id: { type: string }
+        url: { type: string, format: uri }
+        host: { type: string }
+        status: { type: integer }
+        contentType: { type: string }
+        lang: { type: string }
+        title: { type: string }
+        textSize: { type: integer }
+        fetchedAt: { type: integer, description: "epoch ms" }
+        labels:
+          type: array
+          items: { type: string }
+
+    SegmentDoc:
+      type: object
+      properties:
+        id: { type: string }
+        pageId: { type: string }
+        kind: { type: string, enum: [heading, paragraph, code, caption, table] }
+        text: { type: string }
+        pathHint: { type: string }
+        offsetStart: { type: integer }
+        offsetEnd: { type: integer }
+        entities:
+          type: array
+          items: { type: string }
+
+    EntityDoc:
+      type: object
+      properties:
+        id: { type: string }
+        name: { type: string }
+        type: { type: string }
+        pageCount: { type: integer }
+        mentions: { type: integer }
+
+    IndexResult:
+      type: object
+      properties:
+        pagesUpserted: { type: integer }
+        segmentsUpserted: { type: integer }
+        entitiesUpserted: { type: integer }
+        tablesUpserted: { type: integer }
+
+    # -------- Errors --------
+    Error:
+      type: object
+      properties:
+        code: { type: string }
+        message: { type: string }
+        details: { type: object }
+# © 2025 Contexter alias Benedikt Eickhoff 🛡️ All rights reserved.
